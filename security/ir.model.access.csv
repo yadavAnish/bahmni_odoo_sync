@@ -1,0 +1,3 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_bahmni_sync_engine_user,Bahmni Sync Engine,model_bahmni_sync_engine,base.group_system,1,1,1,1
+access_bahmni_sync_log_user,Bahmni Sync Log,model_bahmni_sync_log,base.group_system,1,1,1,1
