@@ -66,7 +66,11 @@ class BahmniSyncEngine(models.Model):
             encounter_uuid = content_url.split("/")[-1].split("?")[0]
             _logger.info("[INFO] Processing encounter: %s", content_url)
 
-            if self.env['bahmni.sync.log'].search_count([('encounter_uuid', '=', encounter_uuid)]):
+            if self.env['bahmni.sync.log'].search_count([
+                ('encounter_uuid', '=', encounter_uuid),
+                 ('status', '=', 'success')
+
+            ]):
                 _logger.info("[SKIP] Encounter %s already synced", encounter_uuid)
                 continue
 
@@ -88,12 +92,9 @@ class BahmniSyncEngine(models.Model):
                 _logger.info("[FOUND] Registration Fee = %s for patient %s", fee_value, patient_id)
 
                 # Ensure Partner
-                partner = self.env['res.partner'].search([('name', '=', patient_id)], limit=1)
-                if not partner:
-                    partner = self.env['res.partner'].create({'name': patient_id, 'customer_rank': 1})
-                    _logger.info("[CREATE] Partner created: %s", partner.name)
-                else:
-                    _logger.info("[EXIST] Using existing partner: %s", partner.name)
+                partner = self.env['res.partner'].search([('ref', '=', patient_id)], limit=1)
+                _logger.info("partner inside reg fee",partner.display_name)
+                
 
                 # Ensure Product
                 product = self.env['product.product'].search([('name', '=', PRODUCT_NAME)], limit=1)
