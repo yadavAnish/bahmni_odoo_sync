@@ -26,50 +26,38 @@ class BahmniSyncEngine(models.Model):
     _name = 'bahmni.sync.engine'
     _description = "Bahmni Sync Engine"
 
-    def sync_registration_fee(self):
-        _logger.info("[START] Bahmni Registration Fee Sync Started")
+    def sync_fees(self):
+        _logger.info("[START] Bahmni Fee Sync Started")
 
         OPENMRS_URL = "http://bahmni-standard-openmrs-1:8080"
         ATOMFEED_URL = f"{OPENMRS_URL}/openmrs/ws/atomfeed/encounter/recent"
-        _logger.info("[CONFIG] ATOMFEED_URL = %s", ATOMFEED_URL)
-
         AUTH = HTTPBasicAuth("admin", "Admin123")
-        PRODUCT_NAME = "Registration Fee"
+        FEE_CONCEPTS = ["Registration Fee", "Consultation Fee"]
         SHOP_ID = 4
         PRICELIST_ID = 1
 
         try:
             response = requests.get(ATOMFEED_URL, headers={"Accept": "application/atom+xml"}, auth=AUTH)
-            _logger.info("[HTTP] AtomFeed Response Status: %s", response.status_code)
             response.raise_for_status()
-            _logger.info(f"[HTTP] AtomFeed Content: {response.text[:5000]}...")
-
             root = ET.fromstring(response.text)
             ns = {'atom': 'http://www.w3.org/2005/Atom'}
             entries = root.findall('atom:entry', ns)
-            _logger.info("[PARSE] Found %d entries in AtomFeed", len(entries))
-        except Exception as e:
+        except Exception:
             _logger.error("[ERROR] Failed to fetch or parse AtomFeed", exc_info=True)
             return
 
-        root = ET.fromstring(response.text)
-        ns = {'atom': 'http://www.w3.org/2005/Atom'}
-
-        for entry in root.findall('atom:entry', ns):
+        for entry in entries:
             content_elem = entry.find('atom:content', ns)
             if content_elem is None or not content_elem.text:
                 continue
 
-            # content_url = content_elem.text.strip()
             content_url = f"{OPENMRS_URL}{content_elem.text.strip()}"
-
             encounter_uuid = content_url.split("/")[-1].split("?")[0]
             _logger.info("[INFO] Processing encounter: %s", content_url)
 
             if self.env['bahmni.sync.log'].search_count([
                 ('encounter_uuid', '=', encounter_uuid),
-                 ('status', '=', 'success')
-
+                ('status', '=', 'success')
             ]):
                 _logger.info("[SKIP] Encounter %s already synced", encounter_uuid)
                 continue
@@ -78,48 +66,63 @@ class BahmniSyncEngine(models.Model):
                 encounter_response = requests.get(content_url, auth=AUTH)
                 encounter_response.raise_for_status()
                 data = encounter_response.json()
-                _logger.debug("[DEBUG] Encounter Data: %s", data)
 
                 patient_id = data.get("patientId")
                 observations = data.get("observations", [])
-                reg_fee_obs = next((o for o in observations if o.get("conceptNameToDisplay") == PRODUCT_NAME), None)
+                _logger.debug("[DEBUG] Total Observations: %d", len(observations))
 
-                if not reg_fee_obs:
-                    _logger.info("[SKIP] No '%s' in encounter %s", PRODUCT_NAME, encounter_uuid)
+                partner = self.env['res.partner'].search([('ref', '=', patient_id)], limit=1)
+                if not partner:
+                    raise Exception(f"Partner with ref {patient_id} not found")
+
+                order_lines = []
+                fee_summary = []
+
+                for concept_name in FEE_CONCEPTS:
+                    _logger.debug("[DEBUG] Searching for fee concept: %s", concept_name)
+                    obs = next((o for o in observations if o.get("conceptNameToDisplay") == concept_name), None)
+
+                    if not obs:
+                        _logger.warning("[NOT FOUND] Observation for concept '%s' not found in encounter %s", concept_name, encounter_uuid)
+                        continue
+
+                    fee_value = obs.get("value")
+                    if fee_value is None:
+                        _logger.warning("[WARNING] Fee value is None for concept '%s'", concept_name)
+                        continue
+
+                    product = self.env['product.product'].search([('name', '=', concept_name)], limit=1)
+                    if not product:
+                        _logger.error("[ERROR] Product not found for concept '%s'", concept_name)
+                        continue
+
+                    _logger.debug("[ADD] Adding order line for product '%s' with value %s", concept_name, fee_value)
+
+                    order_lines.append((0, 0, {
+                        'product_id': product.id,
+                        'product_uom_qty': 1,
+                        'price_unit': fee_value,
+                    }))
+                    fee_summary.append(f"{concept_name}: {fee_value}")
+
+                if not order_lines:
+                    _logger.warning("[SKIP] No fee products found for encounter %s", encounter_uuid)
                     continue
 
-                fee_value = reg_fee_obs.get("value")
-                _logger.info("[FOUND] Registration Fee = %s for patient %s", fee_value, patient_id)
-
-                # Ensure Partner
-                partner = self.env['res.partner'].search([('ref', '=', patient_id)], limit=1)
-                _logger.info("partner inside reg fee",partner.display_name)
-                
-
-                # Ensure Product
-                product = self.env['product.product'].search([('name', '=', PRODUCT_NAME)], limit=1)
-                if not product:
-                    raise Exception(f"Product '{PRODUCT_NAME}' not found")
-
-                # Create Sale Order
                 order = self.env['sale.order'].create({
                     'partner_id': partner.id,
                     'pricelist_id': PRICELIST_ID,
                     'shop_id': SHOP_ID,
-                    'order_line': [(0, 0, {
-                        'product_id': product.id,
-                        'product_uom_qty': 1,
-                        'price_unit': fee_value,
-                    })]
+                    'order_line': order_lines
                 })
-                _logger.info("[SUCCESS] Created sale.order %s for patient %s", order.name, patient_id)
+                _logger.info("[SUCCESS] Created sale.order %s with lines: %s", order.name, fee_summary)
 
                 self.env['bahmni.sync.log'].create({
                     'encounter_uuid': encounter_uuid,
                     'patient_id': patient_id,
-                    'fee': fee_value,
+                    'fee': sum([o[2]['price_unit'] for o in order_lines]),
                     'status': 'success',
-                    'message': f"Order {order.name} created"
+                    'message': f"Order {order.name} created with: {', '.join(fee_summary)}"
                 })
 
             except Exception as e:
@@ -130,4 +133,4 @@ class BahmniSyncEngine(models.Model):
                     'message': str(e)
                 })
 
-        _logger.info("[DONE] Bahmni Registration Fee Sync Completed")
+        _logger.info("[DONE] Bahmni Fee Sync Completed")
